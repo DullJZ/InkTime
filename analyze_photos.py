@@ -131,20 +131,28 @@ DB_PATH = Path(str(getattr(cfg, "DB_PATH", "photos.db") or "photos.db")).expandu
 if not DB_PATH.is_absolute():
     DB_PATH = (ROOT_DIR / DB_PATH).resolve()
 
-# LM Studio/OpenAI 兼容接口（仍允许用环境变量覆盖）
-API_URL = str(
-    getattr(cfg, "API_URL", None)
-    or os.environ.get("LMSTUDIO_URL", "http://127.0.0.1:1234/v1/chat/completions")
-)
+# ---- 渠道列表（支持 429 自动切换） ----
+_raw_channels = getattr(cfg, "API_CHANNELS", None) or []
+if not _raw_channels:
+    # 向后兼容：从旧的单变量配置构建单渠道
+    _compat_url = str(
+        getattr(cfg, "API_URL", None)
+        or os.environ.get("LMSTUDIO_URL", "http://127.0.0.1:1234/v1/chat/completions")
+    )
+    _compat_model = str(
+        getattr(cfg, "MODEL_NAME", None)
+        or os.environ.get("LMSTUDIO_MODEL", "qwen3-vl-32b-instruct")
+    )
+    _compat_key = str(
+        getattr(cfg, "API_KEY", None)
+        or os.environ.get("LMSTUDIO_API_KEY", "")
+    )
+    _raw_channels = [
+        {"api_url": _compat_url, "model_name": _compat_model, "api_key": _compat_key}
+    ]
 
-# 模型名称（仍允许用环境变量覆盖）
-MODEL_NAME = str(
-    getattr(cfg, "MODEL_NAME", None)
-    or os.environ.get("LMSTUDIO_MODEL", "qwen3-vl-32b-instruct")
-)
-
-# API KEY（仍允许用环境变量覆盖）
-API_KEY = str(getattr(cfg, "API_KEY", None) or os.environ.get("LMSTUDIO_API_KEY", ""))
+API_CHANNELS: list[dict] = list(_raw_channels)
+_channel_index: int = 0  # 记住上次成功的渠道位置
 
 # 每次处理多少张；None 为不限制
 BATCH_LIMIT = getattr(cfg, "BATCH_LIMIT", None)
@@ -366,33 +374,35 @@ def generate_side_caption(image_path: Path) -> str | None:
     except Exception:
         return None
 
-    headers = {"Content-Type": "application/json"}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
-                    },
-                ],
-            },
-        ],
-        "temperature": 0.7,
-        "max_tokens": 64,
-        "top_p": 0.9,
-        "stream": False,
-    }
+    def _build(ch):
+        headers = {"Content-Type": "application/json"}
+        key = ch.get("api_key", "")
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        body = {
+            "model": ch["model_name"],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                        },
+                    ],
+                },
+            ],
+            "temperature": 0.7,
+            "max_tokens": 64,
+            "top_p": 0.9,
+            "stream": False,
+        }
+        return ch["api_url"], headers, body
 
     try:
-        resp = requests.post(API_URL, headers=headers, json=payload, timeout=min(120, TIMEOUT))
+        resp = _post_with_channel_fallback(_build, timeout=min(120, TIMEOUT))
     except Exception:
         return None
 
@@ -413,7 +423,7 @@ def generate_side_caption(image_path: Path) -> str | None:
 
 
 def list_images(limit: int | None = None) -> list[Path]:
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic"}
     files = []
     print("[INFO] 正在递归扫描图片目录，请稍候……")
     scanned = 0
@@ -745,6 +755,61 @@ def get_city_resolver():
     return resolve
 
 
+
+# =======================
+# 渠道负载均衡：429 自动切换
+# =======================
+def _post_with_channel_fallback(
+    payload_builder,
+    timeout: float = TIMEOUT,
+) -> requests.Response:
+    """依次尝试各渠道发送请求，遇到 429 自动切换到下一个渠道。
+
+    Args:
+        payload_builder: callable(channel_dict) -> (url, headers, json_body)
+        timeout: 请求超时秒数
+    Returns:
+        第一个非 429 的 requests.Response（可能仍是其他错误码，由调用方处理）
+    Raises:
+        RuntimeError: 所有渠道均返回 429 或请求失败
+    """
+    global _channel_index
+    n = len(API_CHANNELS)
+    if n == 0:
+        raise RuntimeError("未配置任何 VLM 渠道（API_CHANNELS 为空）")
+
+    start = _channel_index % n
+    last_resp: requests.Response | None = None
+
+    for i in range(n):
+        idx = (start + i) % n
+        ch = API_CHANNELS[idx]
+        url, headers, body = payload_builder(ch)
+        ch_label = ch.get("model_name", url)
+
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+        except Exception as e:
+            print(f"[WARN] 渠道 {ch_label} 请求异常：{e}，尝试下一个渠道")
+            continue
+
+        if resp.status_code == 429:
+            print(f"[WARN] 渠道 {ch_label} 返回 429（请求过多），切换到下一个渠道")
+            last_resp = resp
+            continue
+
+        # 非 429 响应（包括成功和其他错误），记住当前渠道并返回
+        _channel_index = idx
+        return resp
+
+    # 所有渠道都失败了
+    if last_resp is not None:
+        raise RuntimeError(
+            f"所有 {n} 个渠道均返回 429，请稍后重试或增加渠道配置"
+        )
+    raise RuntimeError(f"所有 {n} 个渠道均请求失败")
+
+
 def call_vlm(image_path: Path) -> dict:
     try:
         img_b64 = encode_image_to_b64(image_path)
@@ -807,36 +872,38 @@ def call_vlm(image_path: Path) -> dict:
         "下面是照片的内容，请结合图像本身完成上述任务。\n"
     )
 
-    headers = {"Content-Type": "application/json"}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{img_b64}"
+    def _build(ch):
+        headers = {"Content-Type": "application/json"}
+        key = ch.get("api_key", "")
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        body = {
+            "model": ch["model_name"],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_b64}"
+                            },
                         },
-                    },
-                ],
-            },
-        ],
-        "temperature": 0.2,
-        "stream": False,
-    }
+                    ],
+                },
+            ],
+            "temperature": 0.2,
+            "stream": False,
+        }
+        return ch["api_url"], headers, body
 
-    resp = requests.post(API_URL, headers=headers, json=payload, timeout=TIMEOUT)
+    resp = _post_with_channel_fallback(_build, timeout=TIMEOUT)
     if not resp.ok:
         print("HTTP:", resp.status_code)
         print(resp.text)
-        raise RuntimeError(f"LM Studio 请求失败: HTTP {resp.status_code}")
+        raise RuntimeError(f"VLM 请求失败: HTTP {resp.status_code}")
 
     data = resp.json()
     try:
