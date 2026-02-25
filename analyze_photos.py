@@ -11,6 +11,8 @@ import time
 import requests
 import io
 from PIL import Image, ExifTags, ImageOps
+import pillow_heif
+pillow_heif.register_heif_opener()
 import config as cfg
 import shutil
 
@@ -505,7 +507,18 @@ def read_exif(path: Path) -> dict:
                 info["orientation"] = "square"
         except Exception:
             pass
-        exif_raw = img._getexif() or {}
+
+        # 使用公共 API getexif()，兼容 JPEG / PNG / WebP / HEIC 等格式
+        # （_getexif() 是 JPEG 专有的私有方法，HEIC 不支持）
+        exif_obj = img.getexif()
+        if not exif_obj:
+            # 兜底：尝试 _getexif()（旧版 Pillow 或特殊格式）
+            try:
+                exif_raw = img._getexif() or {}
+            except (AttributeError, Exception):
+                exif_raw = {}
+        else:
+            exif_raw = dict(exif_obj)
     except Exception:
         return info
 
@@ -523,28 +536,75 @@ def read_exif(path: Path) -> dict:
     info["f_number"] = exif.get("FNumber")
     info["focal_length"] = exif.get("FocalLength")
 
-    gps_info = exif.get("GPSInfo")
+    # 如果主 EXIF 中缺少 DateTimeOriginal，尝试从 ExifIFD 子 IFD 获取
+    if not info.get("datetime"):
+        try:
+            exif_ifd = exif_obj.get_ifd(ExifTags.IFD.Exif)
+            if exif_ifd:
+                dt = exif_ifd.get(0x9003)  # DateTimeOriginal
+                if dt:
+                    info["datetime"] = dt
+                if not info.get("iso"):
+                    info["iso"] = exif_ifd.get(0x8827)  # ISOSpeedRatings
+                if not info.get("exposure_time"):
+                    info["exposure_time"] = exif_ifd.get(0x829A)  # ExposureTime
+                if not info.get("f_number"):
+                    info["f_number"] = exif_ifd.get(0x829D)  # FNumber
+                if not info.get("focal_length"):
+                    info["focal_length"] = exif_ifd.get(0x920A)  # FocalLength
+        except Exception:
+            pass
+
+    # GPS 信息：优先从 get_ifd() 获取（兼容 HEIC），再降级到旧方式
     lat = lon = None
-    if isinstance(gps_info, dict):
-        # GPSInfo 的 key 可能是数字，需要映射
-        gps_tags = {}
-        for k, v in gps_info.items():
-            name = ExifTags.GPSTAGS.get(k, k)
-            gps_tags[name] = v
 
-        lat_ref = gps_tags.get("GPSLatitudeRef")
-        lat_raw = gps_tags.get("GPSLatitude")
-        lon_ref = gps_tags.get("GPSLongitudeRef")
-        lon_raw = gps_tags.get("GPSLongitude")
+    # 方式 1：通过 get_ifd(GPSInfo) 获取（推荐，HEIC/JPEG 通用）
+    try:
+        gps_ifd = exif_obj.get_ifd(ExifTags.IFD.GPSInfo)
+        if gps_ifd:
+            gps_tags = {}
+            for k, v in gps_ifd.items():
+                name = ExifTags.GPSTAGS.get(k, k)
+                gps_tags[name] = v
 
-        if lat_raw and lat_ref:
-            lat = _convert_gps_to_deg(lat_raw)
-            if lat is not None and lat_ref in ["S", "s"]:
-                lat = -lat
-        if lon_raw and lon_ref:
-            lon = _convert_gps_to_deg(lon_raw)
-            if lon is not None and lon_ref in ["W", "w"]:
-                lon = -lon
+            lat_ref = gps_tags.get("GPSLatitudeRef")
+            lat_raw = gps_tags.get("GPSLatitude")
+            lon_ref = gps_tags.get("GPSLongitudeRef")
+            lon_raw = gps_tags.get("GPSLongitude")
+
+            if lat_raw and lat_ref:
+                lat = _convert_gps_to_deg(lat_raw)
+                if lat is not None and lat_ref in ["S", "s"]:
+                    lat = -lat
+            if lon_raw and lon_ref:
+                lon = _convert_gps_to_deg(lon_raw)
+                if lon is not None and lon_ref in ["W", "w"]:
+                    lon = -lon
+    except Exception:
+        pass
+
+    # 方式 2：降级到旧的 GPSInfo dict（某些 JPEG 可能走这条路径）
+    if lat is None or lon is None:
+        gps_info = exif.get("GPSInfo")
+        if isinstance(gps_info, dict):
+            gps_tags = {}
+            for k, v in gps_info.items():
+                name = ExifTags.GPSTAGS.get(k, k)
+                gps_tags[name] = v
+
+            lat_ref = gps_tags.get("GPSLatitudeRef")
+            lat_raw = gps_tags.get("GPSLatitude")
+            lon_ref = gps_tags.get("GPSLongitudeRef")
+            lon_raw = gps_tags.get("GPSLongitude")
+
+            if lat_raw and lat_ref:
+                lat = _convert_gps_to_deg(lat_raw)
+                if lat is not None and lat_ref in ["S", "s"]:
+                    lat = -lat
+            if lon_raw and lon_ref:
+                lon = _convert_gps_to_deg(lon_raw)
+                if lon is not None and lon_ref in ["W", "w"]:
+                    lon = -lon
 
     info["gps_lat"] = lat
     info["gps_lon"] = lon
