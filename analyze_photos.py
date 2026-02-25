@@ -760,21 +760,26 @@ def get_city_resolver():
 
 
 # =======================
-# 渠道负载均衡：429 自动切换
+# 渠道负载均衡：遇错自动切换
 # =======================
 def _post_with_channel_fallback(
     payload_builder,
     timeout: float = TIMEOUT,
-) -> requests.Response:
-    """依次尝试各渠道发送请求，遇到 429 自动切换到下一个渠道。
+    response_parser=None,
+) -> requests.Response | tuple:
+    """依次尝试各渠道发送请求，遇到错误自动切换到下一个渠道。
 
     Args:
         payload_builder: callable(channel_dict) -> (url, headers, json_body)
         timeout: 请求超时秒数
+        response_parser: 可选，callable(response) -> parsed_result。
+            若提供，会在收到 2xx 后调用；若解析抛异常则视为失败并切换渠道。
+            若未提供，直接返回 response 对象。
     Returns:
-        第一个非 429 的 requests.Response（可能仍是其他错误码，由调用方处理）
+        response_parser 未提供时返回 requests.Response；
+        提供时返回 response_parser 的返回值。
     Raises:
-        RuntimeError: 所有渠道均返回 429 或请求失败
+        RuntimeError: 所有渠道均请求失败
     """
     global _channel_index
     n = len(API_CHANNELS)
@@ -783,7 +788,7 @@ def _post_with_channel_fallback(
 
     with _channel_lock:
         start = _channel_index % n
-    last_resp: requests.Response | None = None
+    last_error: str | None = None
 
     for i in range(n):
         idx = (start + i) % n
@@ -795,24 +800,35 @@ def _post_with_channel_fallback(
             resp = requests.post(url, headers=headers, json=body, timeout=timeout)
         except Exception as e:
             print(f"[WARN] 渠道 {ch_label} 请求异常：{e}，尝试下一个渠道")
+            last_error = str(e)
             continue
 
-        if resp.status_code == 429:
-            print(f"[WARN] 渠道 {ch_label} 返回 429（请求过多），切换到下一个渠道")
-            last_resp = resp
+        if not resp.ok:
+            print(f"[WARN] 渠道 {ch_label} 返回 HTTP {resp.status_code}，切换到下一个渠道")
+            last_error = f"HTTP {resp.status_code}"
             continue
 
-        # 非 429 响应（包括成功和其他错误），记住当前渠道并返回
+        # 2xx 成功，如果有 parser 则尝试解析
+        if response_parser is not None:
+            try:
+                parsed = response_parser(resp)
+            except Exception as e:
+                print(f"[WARN] 渠道 {ch_label} 响应解析失败：{e}，切换到下一个渠道")
+                last_error = str(e)
+                continue
+            with _channel_lock:
+                _channel_index = idx
+            return parsed
+
+        # 无 parser，直接返回 response
         with _channel_lock:
             _channel_index = idx
         return resp
 
     # 所有渠道都失败了
-    if last_resp is not None:
-        raise RuntimeError(
-            f"所有 {n} 个渠道均返回 429，请稍后重试或增加渠道配置"
-        )
-    raise RuntimeError(f"所有 {n} 个渠道均请求失败")
+    raise RuntimeError(
+        f"所有 {n} 个渠道均请求失败（最后错误：{last_error}），请检查渠道配置"
+    )
 
 
 def call_vlm(image_path: Path) -> dict:
@@ -904,27 +920,16 @@ def call_vlm(image_path: Path) -> dict:
         }
         return ch["api_url"], headers, body
 
-    resp = _post_with_channel_fallback(_build, timeout=TIMEOUT)
-    if not resp.ok:
-        print("HTTP:", resp.status_code)
-        print(resp.text)
-        raise RuntimeError(f"VLM 请求失败: HTTP {resp.status_code}")
-
-    data = resp.json()
-    try:
+    def _parse_vlm_response(resp):
+        """解析 VLM 响应，失败时抛异常以触发渠道切换。"""
+        data = resp.json()
         content = data["choices"][0]["message"]["content"].strip()
-    except Exception:
-        print("[DEBUG] 返回内容：", data)
-        raise RuntimeError("解析失败：无法从 choices[0].message.content 读取内容")
-
-    # content 应该是 JSON 字符串
-    try:
         obj = json.loads(content)
-    except Exception:
-        print("[DEBUG] 非 JSON 输出：", content)
-        raise RuntimeError("解析失败：模型未按 JSON 输出")
+        return obj
 
-    return obj, exif_info
+    result = _post_with_channel_fallback(_build, timeout=TIMEOUT, response_parser=_parse_vlm_response)
+
+    return result, exif_info
 
 
 def _process_one_photo(path: Path, city_resolver) -> dict | None:
