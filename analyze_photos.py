@@ -8,6 +8,8 @@ import sqlite3
 import os
 import subprocess
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import io
 from PIL import Image, ExifTags, ImageOps
@@ -153,6 +155,7 @@ if not _raw_channels:
 
 API_CHANNELS: list[dict] = list(_raw_channels)
 _channel_index: int = 0  # 记住上次成功的渠道位置
+_channel_lock = threading.Lock()  # 保护 _channel_index 的并发访问
 
 # 每次处理多少张；None 为不限制
 BATCH_LIMIT = getattr(cfg, "BATCH_LIMIT", None)
@@ -778,7 +781,8 @@ def _post_with_channel_fallback(
     if n == 0:
         raise RuntimeError("未配置任何 VLM 渠道（API_CHANNELS 为空）")
 
-    start = _channel_index % n
+    with _channel_lock:
+        start = _channel_index % n
     last_resp: requests.Response | None = None
 
     for i in range(n):
@@ -799,7 +803,8 @@ def _post_with_channel_fallback(
             continue
 
         # 非 429 响应（包括成功和其他错误），记住当前渠道并返回
-        _channel_index = idx
+        with _channel_lock:
+            _channel_index = idx
         return resp
 
     # 所有渠道都失败了
@@ -922,12 +927,174 @@ def call_vlm(image_path: Path) -> dict:
     return obj, exif_info
 
 
+def _process_one_photo(path: Path, city_resolver) -> dict | None:
+    """处理单张照片：调用 VLM + 生成文案 + 提取 EXIF。
+
+    成功返回包含所有数据库字段的 dict，失败返回 None。
+    此函数仅做计算 + 网络 IO（不写数据库），线程安全。
+    """
+    t_photo_start = time.perf_counter()
+    try:
+        result, exif_info = call_vlm(path)
+    except Exception as e:
+        print(f"[WARN] 调用模型失败: {e}")
+        return None
+
+    caption = str(result.get("caption", "")).strip()
+    ptype = str(result.get("type", "")).strip()
+    try:
+        memory_score = float(result.get("memory_score", 0.0))
+    except Exception:
+        memory_score = 0.0
+    try:
+        beauty_score = float(result.get("beauty_score", 0.0))
+    except Exception:
+        beauty_score = 0.0
+    reason = str(result.get("reason", "")).strip()
+
+    side_caption = generate_side_caption(path)
+
+    width = exif_info.get("width")
+    height = exif_info.get("height")
+    orientation = exif_info.get("orientation")
+
+    exif_datetime = exif_info.get("datetime")
+    exif_make = exif_info.get("make")
+    exif_model_val = exif_info.get("model")
+
+    def _to_int(v):
+        try:
+            return int(v) if v is not None else None
+        except Exception:
+            return None
+
+    def _to_float(v):
+        try:
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    exif_iso = _to_int(exif_info.get("iso"))
+    exif_exposure_time = _to_float(exif_info.get("exposure_time"))
+    exif_f_number = _to_float(exif_info.get("f_number"))
+    exif_focal_length = _to_float(exif_info.get("focal_length"))
+    exif_gps_lat = _to_float(exif_info.get("gps_lat"))
+    exif_gps_lon = _to_float(exif_info.get("gps_lon"))
+    exif_gps_alt = _to_float(exif_info.get("gps_alt"))
+
+    if exif_gps_lat is not None and exif_gps_lon is not None:
+        exif_city = city_resolver(exif_gps_lat, exif_gps_lon)
+    else:
+        exif_city = ""
+
+    lat = exif_info.get("gps_lat")
+    lon = exif_info.get("gps_lon")
+    if lat is not None and lon is not None and not in_home(lat, lon):
+        memory_score = min(memory_score + 5.0, 100.0)
+
+    t_photo_end = time.perf_counter()
+
+    return {
+        "path": str(path),
+        "caption": caption,
+        "type": ptype,
+        "memory_score": memory_score,
+        "beauty_score": beauty_score,
+        "reason": reason,
+        "width": width,
+        "height": height,
+        "orientation": orientation,
+        "exif_json": json.dumps(exif_info, ensure_ascii=False, default=str),
+        "raw_json": json.dumps(result, ensure_ascii=False),
+        "exif_datetime": exif_datetime,
+        "exif_make": exif_make,
+        "exif_model": exif_model_val,
+        "exif_iso": exif_iso,
+        "exif_exposure_time": exif_exposure_time,
+        "exif_f_number": exif_f_number,
+        "exif_focal_length": exif_focal_length,
+        "exif_gps_lat": exif_gps_lat,
+        "exif_gps_lon": exif_gps_lon,
+        "exif_gps_alt": exif_gps_alt,
+        "side_caption": side_caption,
+        "exif_city": exif_city,
+        "cost": t_photo_end - t_photo_start,
+    }
+
+
+def _save_result_to_db(cur, conn, rec: dict):
+    """将一条处理结果写入数据库。"""
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO photo_scores
+        (path, caption, type, memory_score, beauty_score, reason,
+         width, height, orientation, used_at,
+         exif_json, raw_json,
+         exif_datetime, exif_make, exif_model,
+         exif_iso, exif_exposure_time, exif_f_number, exif_focal_length,
+         exif_gps_lat, exif_gps_lon, exif_gps_alt, side_caption, exif_city)
+        VALUES (?, ?, ?, ?, ?, ?,
+                ?, ?, ?, COALESCE((SELECT used_at FROM photo_scores WHERE path = ?), NULL),
+                ?, ?,
+                ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?)
+        """,
+        (
+            rec["path"],
+            rec["caption"],
+            rec["type"],
+            rec["memory_score"],
+            rec["beauty_score"],
+            rec["reason"],
+            rec["width"],
+            rec["height"],
+            rec["orientation"],
+            rec["path"],
+            rec["exif_json"],
+            rec["raw_json"],
+            rec["exif_datetime"],
+            rec["exif_make"],
+            rec["exif_model"],
+            rec["exif_iso"],
+            rec["exif_exposure_time"],
+            rec["exif_f_number"],
+            rec["exif_focal_length"],
+            rec["exif_gps_lat"],
+            rec["exif_gps_lon"],
+            rec["exif_gps_alt"],
+            rec["side_caption"],
+            rec["exif_city"],
+        ),
+    )
+    conn.commit()
+
+
+def _print_result(rec: dict):
+    """打印单张照片处理结果摘要。"""
+    print(f"  类型    ：{rec['type']}")
+    print(f"  回忆分  ：{rec['memory_score']:.1f}")
+    print(f"  美观分  ：{rec['beauty_score']:.1f}")
+    if rec["side_caption"]:
+        print(f"  一句话文案：{rec['side_caption']}")
+    else:
+        print("  一句话文案：(无)")
+    print(f"  画面描述：{rec['caption']}")
+    print(f"  理由    ：{rec['reason']}")
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="分析照片并生成评分")
     parser.add_argument("--cache", action="store_true",
                         help="启用文件列表缓存：首次扫描后写入缓存，后续直接读取")
+    parser.add_argument("-j", "--concurrency", type=int, default=1,
+                        help="并发处理线程数（默认 1，即串行处理）")
     args = parser.parse_args()
+
+    concurrency = max(1, args.concurrency)
+    if concurrency > 1:
+        print(f"[INFO] 并发模式：{concurrency} 个工作线程")
 
     filelist_path = ROOT_DIR / "filelist.txt"
     cache_path = ROOT_DIR / ".filelist_cache.txt"
@@ -953,7 +1120,7 @@ def main():
     if not imgs:
         raise SystemExit("[INFO] 所有图片都被 Screenshot 过滤规则排除了，没有可处理的图片。")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     ensure_table(conn)
     city_resolver = get_city_resolver()
 
@@ -1041,161 +1208,90 @@ def main():
     print(f"[INFO] 本次准备处理 {len(target_paths)} 张图片（快照总数 {total}，已分析 {already_done}）。")
 
     cur = conn.cursor()
+    db_lock = threading.Lock()   # 保护 SQLite 写入操作
     start_time = time.time()
 
-    for idx, path in enumerate(target_paths, start=1):
-        t_photo_start = time.perf_counter()
-        sep = "=" * 60
-        print("\n" + sep)
-        print(f"[{idx}/{len(target_paths)}] 处理: {path}")
-        try:
-            result, exif_info = call_vlm(path)
-        except Exception as e:
-            print(f"[WARN] 调用模型失败: {e}")
-            continue
-        t_after_vlm = time.perf_counter()
-        vlm_cost = t_after_vlm - t_photo_start
+    if concurrency <= 1:
+        # ==================== 串行模式（原有逻辑）====================
+        for idx, path in enumerate(target_paths, start=1):
+            t_photo_start = time.perf_counter()
+            sep = "=" * 60
+            print("\n" + sep)
+            print(f"[{idx}/{len(target_paths)}] 处理: {path}")
 
-        caption = str(result.get("caption", "")).strip()
-        ptype = str(result.get("type", "")).strip()
-        try:
-            memory_score = float(result.get("memory_score", 0.0))
-        except Exception:
-            memory_score = 0.0
-        try:
-            beauty_score = float(result.get("beauty_score", 0.0))
-        except Exception:
-            beauty_score = 0.0
-        reason = str(result.get("reason", "")).strip()
+            rec = _process_one_photo(path, city_resolver)
+            if rec is None:
+                continue
 
-        side_caption = generate_side_caption(path)
-        t_after_side = time.perf_counter()
-        side_cost = t_after_side - t_after_vlm
+            _print_result(rec)
+            _save_result_to_db(cur, conn, rec)
 
-        width = exif_info.get("width")
-        height = exif_info.get("height")
-        orientation = exif_info.get("orientation")
+            t_photo_end = time.perf_counter()
+            total_cost = t_photo_end - t_photo_start
 
-        exif_datetime = exif_info.get("datetime")
-        exif_make = exif_info.get("make")
-        exif_model = exif_info.get("model")
+            processed_now = already_done + idx
+            denom = total if total > 0 else 1
+            progress = max(0.0, min(1.0, processed_now / denom))
 
-        def _to_int(v):
-            try:
-                if v is None:
-                    return None
-                return int(v)
-            except Exception:
-                return None
+            bar_width = 30
+            filled = int(bar_width * progress)
+            bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
 
-        def _to_float(v):
-            try:
-                if v is None:
-                    return None
-                return float(v)
-            except Exception:
-                return None
+            elapsed = time.time() - start_time
+            avg_per = elapsed / idx if idx > 0 else 0
+            remaining = max(total - processed_now, 0)
+            eta = format_eta(remaining * avg_per) if avg_per > 0 else "00:00:00"
 
-        exif_iso = _to_int(exif_info.get("iso"))
-        exif_exposure_time = _to_float(exif_info.get("exposure_time"))
-        exif_f_number = _to_float(exif_info.get("f_number"))
-        exif_focal_length = _to_float(exif_info.get("focal_length"))
-        exif_gps_lat = _to_float(exif_info.get("gps_lat"))
-        exif_gps_lon = _to_float(exif_info.get("gps_lon"))
-        exif_gps_alt = _to_float(exif_info.get("gps_alt"))
+            print(f"[进度] {bar} {progress*100:5.1f}%  {processed_now}/{total}  本张耗时 {total_cost:4.1f}s  预计剩余 {eta} ")
+    else:
+        # ==================== 并发模式 ====================
+        print_lock = threading.Lock()
+        completed_count = 0
+        completed_lock = threading.Lock()
 
-        if exif_gps_lat is not None and exif_gps_lon is not None:
-            exif_city = city_resolver(exif_gps_lat, exif_gps_lon)
-        else:
-            exif_city = ""
+        def _worker(idx: int, path: Path) -> tuple[int, Path, dict | None]:
+            return idx, path, _process_one_photo(path, city_resolver)
 
-        # 如果有 GPS 信息且不在本地范围内，略微提高回忆分（最多 +5，且不超过 100 分）
-        lat = exif_info.get("gps_lat")
-        lon = exif_info.get("gps_lon")
-        if lat is not None and lon is not None and not in_home(lat, lon):
-            memory_score = min(memory_score + 5.0, 100.0)
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {
+                executor.submit(_worker, idx, path): (idx, path)
+                for idx, path in enumerate(target_paths, start=1)
+            }
 
-        exif_json = json.dumps(exif_info, ensure_ascii=False, default=str)
+            for future in as_completed(futures):
+                idx, path, rec = future.result()
 
-        print(f"  类型    ：{ptype}")
-        print(f"  回忆分  ：{memory_score:.1f}")
-        print(f"  美观分  ：{beauty_score:.1f}")
-        if side_caption:
-            print(f"  一句话文案：{side_caption}")
-        else:
-            print("  一句话文案：(无)")
-        print(f"  画面描述：{caption}")
-        print(f"  理由    ：{reason}")
+                with completed_lock:
+                    completed_count += 1
+                    done_so_far = completed_count
 
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO photo_scores
-            (path, caption, type, memory_score, beauty_score, reason,
-             width, height, orientation, used_at,
-             exif_json, raw_json,
-             exif_datetime, exif_make, exif_model,
-             exif_iso, exif_exposure_time, exif_f_number, exif_focal_length,
-             exif_gps_lat, exif_gps_lon, exif_gps_alt, side_caption, exif_city)
-            VALUES (?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, COALESCE((SELECT used_at FROM photo_scores WHERE path = ?), NULL),
-                    ?, ?,
-                    ?, ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?)
-            """,
-            (
-                str(path),
-                caption,
-                ptype,
-                memory_score,
-                beauty_score,
-                reason,
-                width,
-                height,
-                orientation,
-                str(path),
-                exif_json,
-                json.dumps(result, ensure_ascii=False),
-                exif_datetime,
-                exif_make,
-                exif_model,
-                exif_iso,
-                exif_exposure_time,
-                exif_f_number,
-                exif_focal_length,
-                exif_gps_lat,
-                exif_gps_lon,
-                exif_gps_alt,
-                side_caption,
-                exif_city,
-            ),
-        )
-        conn.commit()
-        t_photo_end = time.perf_counter()
-        total_cost = t_photo_end - t_photo_start
-        # pretty timing summary
+                with print_lock:
+                    sep = "=" * 60
+                    print("\n" + sep)
+                    print(f"[{done_so_far}/{len(target_paths)}] 完成: {path}")
 
-        # 进度条与预估时间（以本次启动时的快照为准，不受运行中新增照片影响）
-        processed_now = already_done + idx
+                    if rec is not None:
+                        _print_result(rec)
+                        with db_lock:
+                            _save_result_to_db(cur, conn, rec)
+                    else:
+                        print("  (处理失败，已跳过)")
 
-        denom = total if total > 0 else 1
-        progress = processed_now / denom
-        # 夹紧，确保不会超过 100%
-        if progress < 0:
-            progress = 0.0
-        if progress > 1:
-            progress = 1.0
+                    processed_now = already_done + done_so_far
+                    denom = total if total > 0 else 1
+                    progress = max(0.0, min(1.0, processed_now / denom))
 
-        bar_width = 30
-        filled = int(bar_width * progress)
-        bar = "█" * filled + "░" * (bar_width - filled)
+                    bar_width = 30
+                    filled = int(bar_width * progress)
+                    bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
 
-        elapsed = time.time() - start_time
-        avg_per = elapsed / idx if idx > 0 else 0
-        remaining = max(total - processed_now, 0)
-        eta = format_eta(remaining * avg_per) if avg_per > 0 else "00:00:00"
+                    elapsed = time.time() - start_time
+                    avg_per = elapsed / done_so_far if done_so_far > 0 else 0
+                    remaining = max(total - processed_now, 0)
+                    eta = format_eta(remaining * avg_per) if avg_per > 0 else "00:00:00"
 
-        print(f"[进度] {bar} {progress*100:5.1f}%  {processed_now}/{total}  本张耗时 {total_cost:4.1f}s  预计剩余 {eta} ")
+                    cost_str = f"{rec['cost']:4.1f}s" if rec else "N/A"
+                    print(f"[进度] {bar} {progress*100:5.1f}%  {processed_now}/{total}  本张耗时 {cost_str}  预计剩余 {eta} ")
 
     conn.close()
     print("\n[完成] 本批次处理完成。")
