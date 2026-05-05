@@ -59,7 +59,7 @@ vi config.py
 ```
 必须配置以下字段：  
 照片库路径 ```IMAGE_DIR```  
-VLM 模型接口 ```API_URL``` ```MODEL_NAME```  
+VLM 模型接口 ```API_CHANNELS```  
 InkTime 使用 OpenAI 接口（LM Studio / 其它兼容服务均可）。
 
 为防止照片隐私泄露，建议修改```DOWNLOAD_KEY```，为 ESP32 下载路径加一个随机前缀作为密钥。   
@@ -75,24 +75,6 @@ InkTime 使用 OpenAI 接口（LM Studio / 其它兼容服务均可）。
 
 ```python3 analyze_photos.py```
 
-常用参数：
-
-```bash
-python3 analyze_photos.py -j 4
-python3 analyze_photos.py --debug
-python3 analyze_photos.py --cache
-```
-
-- `-j, --concurrency`：并发处理线程数，默认 `1`。本地模型或多渠道接口吞吐足够时可适当调大。
-- `--debug`：请求失败时打印请求体和响应体，便于排查接口兼容性或返回格式问题。
-- `--cache`：复用旧的文件列表缓存，跳过目录扫描，仅建议调试时临时使用。
-
-如仅为调试提示词或接口联调，也可临时使用：
-
-```python3 analyze_photos.py --cache```
-
-`--cache` 只建议用于调试提速。它会复用旧的文件列表缓存，跳过重新扫描照片目录，因此不适合生产环境：新增照片不会被发现，NAS/磁盘上已删除照片的旧数据库记录也可能继续保留。
-
 视觉大模型会读取并理解相册目录中的所有文件，为每张照片生成：
 
 - 画面描述
@@ -107,6 +89,19 @@ python3 analyze_photos.py --cache
 程序可以断点续跑，已处理过的照片信息不会重复分析。你可以分几天分析完你的整个相册。
 
 *请根据你拥有的算力选择合适的模型，作者使用的 qwen3-vl-30b 已经能取得相当不错的文案。*
+
+常用参数：
+
+```bash
+python3 analyze_photos.py -j 4
+python3 analyze_photos.py --debug
+python3 analyze_photos.py --cache
+```
+
+- ```-j```, ```--concurrency```：并发处理线程数，默认 `1`。本地模型或多渠道接口吞吐足够时可适当调大。
+- ```--debug```：请求失败时打印请求体和响应体，便于排查接口兼容性或返回格式问题。
+- ```--cache```：使用上次缓存过的相册文件列表，可防止每次跑模型都重复扫描相册目录。仅在相册首次全量分析时打开，勿在生产环境中使用，否则相册新增照片不会被发现，已删除的照片也不会从数据库中清除。
+
 
 ## 为 ESP32 渲染"历史上的今天"照片
 执行：
