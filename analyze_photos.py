@@ -155,6 +155,8 @@ if not _raw_channels:
 
 API_CHANNELS: list[dict] = list(_raw_channels)
 _channel_index: int = 0  # 记住上次成功的渠道位置
+_channel_cooldown_until: list[float] = [0.0] * len(API_CHANNELS)
+_channel_inflight: list[int] = [0] * len(API_CHANNELS)
 _channel_lock = threading.Lock()  # 保护 _channel_index 的并发访问
 
 # 每次处理多少张；None 为不限制
@@ -162,6 +164,14 @@ BATCH_LIMIT = getattr(cfg, "BATCH_LIMIT", None)
 
 # 请求超时时间（秒）
 TIMEOUT = float(getattr(cfg, "TIMEOUT", 600) or 600)
+
+# 某个渠道失败后，临时降低其优先级的冷却时间（秒）。
+# 例如 A 失败、B 成功后，后续会优先从 B 开始，而不是每次都先打 A。
+_raw_failover_cooldown = getattr(cfg, "CHANNEL_FAILOVER_COOLDOWN_SEC", 300)
+if _raw_failover_cooldown is None:
+    CHANNEL_FAILOVER_COOLDOWN_SEC = 300.0
+else:
+    CHANNEL_FAILOVER_COOLDOWN_SEC = float(_raw_failover_cooldown)
 
 # 发送给 VLM 之前，先把图片长边缩放到该值（像素）。
 # 0 表示不缩放。
@@ -765,6 +775,67 @@ def get_city_resolver():
 # =======================
 # 渠道负载均衡：遇错自动切换
 # =======================
+def _reserve_next_channel(tried: set[int]) -> int | None:
+    n = len(API_CHANNELS)
+    now = time.monotonic()
+    with _channel_lock:
+        start = _channel_index % n
+        ordered = [(start + i) % n for i in range(n) if ((start + i) % n) not in tried]
+
+        ready_idle: list[int] = []
+        ready_busy: list[int] = []
+        cooling_idle: list[int] = []
+        cooling_busy: list[int] = []
+
+        for idx in ordered:
+            cooling = _channel_cooldown_until[idx] > now
+            busy = _channel_inflight[idx] > 0
+            if not cooling and not busy:
+                ready_idle.append(idx)
+            elif not cooling:
+                ready_busy.append(idx)
+            elif not busy:
+                cooling_idle.append(idx)
+            else:
+                cooling_busy.append(idx)
+
+        candidates = ready_idle or ready_busy or cooling_idle or cooling_busy
+        if not candidates:
+            return None
+
+        idx = candidates[0]
+        _channel_inflight[idx] += 1
+        return idx
+
+
+def _release_channel(idx: int) -> None:
+    with _channel_lock:
+        if 0 <= idx < len(_channel_inflight) and _channel_inflight[idx] > 0:
+            _channel_inflight[idx] -= 1
+
+
+def _mark_channel_failure(idx: int, ch_label: str, reason: str) -> None:
+    if CHANNEL_FAILOVER_COOLDOWN_SEC <= 0:
+        return
+
+    until = time.monotonic() + CHANNEL_FAILOVER_COOLDOWN_SEC
+    with _channel_lock:
+        if 0 <= idx < len(_channel_cooldown_until):
+            _channel_cooldown_until[idx] = max(_channel_cooldown_until[idx], until)
+
+    print(
+        f"[WARN] 渠道 {ch_label} 进入冷却 {CHANNEL_FAILOVER_COOLDOWN_SEC:g} 秒：{reason}"
+    )
+
+
+def _mark_channel_success(idx: int) -> None:
+    global _channel_index
+    with _channel_lock:
+        _channel_index = idx
+        if 0 <= idx < len(_channel_cooldown_until):
+            _channel_cooldown_until[idx] = 0.0
+
+
 def _post_with_channel_fallback(
     payload_builder,
     timeout: float = TIMEOUT,
@@ -784,66 +855,71 @@ def _post_with_channel_fallback(
     Raises:
         RuntimeError: 所有渠道均请求失败
     """
-    global _channel_index
     n = len(API_CHANNELS)
     if n == 0:
         raise RuntimeError("未配置任何 VLM 渠道（API_CHANNELS 为空）")
 
-    with _channel_lock:
-        start = _channel_index % n
     last_error: str | None = None
+    tried: set[int] = set()
 
-    for i in range(n):
-        idx = (start + i) % n
+    for _ in range(n):
+        idx = _reserve_next_channel(tried)
+        if idx is None:
+            break
+        tried.add(idx)
         ch = API_CHANNELS[idx]
         url, headers, body = payload_builder(ch)
         ch_label = ch.get("model_name", url)
 
         try:
-            resp = requests.post(url, headers=headers, json=body, timeout=timeout)
-        except Exception as e:
-            print(f"[WARN] 渠道 {ch_label} 请求异常：{e}，尝试下一个渠道")
-            last_error = str(e)
-            continue
-
-        if not resp.ok:
-            print(f"[WARN] 渠道 {ch_label} 返回 HTTP {resp.status_code}，切换到下一个渠道")
-            last_error = f"HTTP {resp.status_code}"
-            if DEBUG:
-                try:
-                    _body_str = json.dumps(body, ensure_ascii=False)
-                    # base64 内容太长，截断后打印
-                    import re as _re
-                    _body_debug = _re.sub(
-                        r'("data:[^;]+;base64,)([A-Za-z0-9+/=]{200})[A-Za-z0-9+/=]+',
-                        r'\1\2…<truncated>',
-                        _body_str,
-                    )
-                    print(f"[DEBUG] 请求体（base64 已截断）:\n{_body_debug}")
-                except Exception:
-                    pass
-                try:
-                    print(f"[DEBUG] 响应体:\n{resp.text}")
-                except Exception:
-                    pass
-            continue
-
-        # 2xx 成功，如果有 parser 则尝试解析
-        if response_parser is not None:
             try:
-                parsed = response_parser(resp)
+                resp = requests.post(url, headers=headers, json=body, timeout=timeout)
             except Exception as e:
-                print(f"[WARN] 渠道 {ch_label} 响应解析失败：{e}，切换到下一个渠道")
+                print(f"[WARN] 渠道 {ch_label} 请求异常：{e}，尝试下一个渠道")
                 last_error = str(e)
+                _mark_channel_failure(idx, ch_label, f"请求异常：{e}")
                 continue
-            with _channel_lock:
-                _channel_index = 0
-            return parsed
 
-        # 无 parser，直接返回 response
-        with _channel_lock:
-            _channel_index = 0
-        return resp
+            if not resp.ok:
+                print(f"[WARN] 渠道 {ch_label} 返回 HTTP {resp.status_code}，切换到下一个渠道")
+                last_error = f"HTTP {resp.status_code}"
+                _mark_channel_failure(idx, ch_label, f"HTTP {resp.status_code}")
+                if DEBUG:
+                    try:
+                        _body_str = json.dumps(body, ensure_ascii=False)
+                        # base64 内容太长，截断后打印
+                        import re as _re
+                        _body_debug = _re.sub(
+                            r'("data:[^;]+;base64,)([A-Za-z0-9+/=]{200})[A-Za-z0-9+/=]+',
+                            r'\1\2…<truncated>',
+                            _body_str,
+                        )
+                        print(f"[DEBUG] 请求体（base64 已截断）:\n{_body_debug}")
+                    except Exception:
+                        pass
+                    try:
+                        print(f"[DEBUG] 响应体:\n{resp.text}")
+                    except Exception:
+                        pass
+                continue
+
+            # 2xx 成功，如果有 parser 则尝试解析
+            if response_parser is not None:
+                try:
+                    parsed = response_parser(resp)
+                except Exception as e:
+                    print(f"[WARN] 渠道 {ch_label} 响应解析失败：{e}，切换到下一个渠道")
+                    last_error = str(e)
+                    _mark_channel_failure(idx, ch_label, f"响应解析失败：{e}")
+                    continue
+                _mark_channel_success(idx)
+                return parsed
+
+            # 无 parser，直接返回 response
+            _mark_channel_success(idx)
+            return resp
+        finally:
+            _release_channel(idx)
 
     # 所有渠道都失败了
     raise RuntimeError(

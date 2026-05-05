@@ -26,6 +26,10 @@ BATCH_LIMIT = None
 # 请求超时时间（秒）
 TIMEOUT = 600
 
+# 某个渠道失败后，临时降低其优先级的冷却时间（秒）
+# 例如 A 失败、B 成功后，在冷却期内后续照片会优先从 B 开始请求
+CHANNEL_FAILOVER_COOLDOWN_SEC = 300
+
 # 为防止照片隐私泄露，建议为 ESP32 下载路径加一个随机前缀作为密钥
 # 前缀修改后，请同步修改 esp32/ink-display-7C-photo/ink-display-7C-photo.ino 固件中的 DAILY_PHOTO_PATH_PREFIX 字段）
 DOWNLOAD_KEY = "yourdownloadkey"
