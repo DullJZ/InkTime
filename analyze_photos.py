@@ -439,7 +439,7 @@ def generate_side_caption(image_path: Path) -> str | None:
 
 
 def list_images(limit: int | None = None) -> list[Path]:
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic"}
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic", ".heif"}
     files = []
     print("[INFO] 正在递归扫描图片目录，请稍候……")
     scanned = 0
