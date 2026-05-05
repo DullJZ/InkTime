@@ -1112,7 +1112,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="分析照片并生成评分")
     parser.add_argument("--cache", action="store_true",
-                        help="启用文件列表缓存：首次扫描后写入缓存，后续直接读取")
+                        help="调试用途：缓存文件列表以跳过目录扫描；不适合生产同步")
     parser.add_argument("-j", "--concurrency", type=int, default=1,
                         help="并发处理线程数（默认 1，即串行处理）")
     parser.add_argument("--debug", action="store_true",
@@ -1130,6 +1130,10 @@ def main():
 
     filelist_path = ROOT_DIR / "filelist.txt"
     cache_path = ROOT_DIR / ".filelist_cache.txt"
+
+    if args.cache:
+        print("[WARN] --cache 仅建议用于调试提速，不适合生产环境。")
+        print("[WARN] 使用缓存会跳过目录重扫：新增照片不会被发现，已删除照片的旧记录也可能保留在数据库中。")
 
     if args.cache and cache_path.exists():
         print(f"[INFO] 读取缓存文件列表：{cache_path}")
