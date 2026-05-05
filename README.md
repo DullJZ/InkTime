@@ -75,6 +75,18 @@ InkTime 使用 OpenAI 接口（LM Studio / 其它兼容服务均可）。
 
 ```python3 analyze_photos.py```
 
+常用参数：
+
+```bash
+python3 analyze_photos.py -j 4
+python3 analyze_photos.py --debug
+python3 analyze_photos.py --cache
+```
+
+- `-j, --concurrency`：并发处理线程数，默认 `1`。本地模型或多渠道接口吞吐足够时可适当调大。
+- `--debug`：请求失败时打印请求体和响应体，便于排查接口兼容性或返回格式问题。
+- `--cache`：复用旧的文件列表缓存，跳过目录扫描，仅建议调试时临时使用。
+
 如仅为调试提示词或接口联调，也可临时使用：
 
 ```python3 analyze_photos.py --cache```
